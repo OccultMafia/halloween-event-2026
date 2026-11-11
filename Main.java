@@ -9,6 +9,7 @@ import net.runelite.api.Player;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ClientTick;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.util.Text;
 import org.pureapps.api.AutoRun;
 import org.pureapps.api.input.IdleInput;
@@ -22,6 +23,7 @@ public class Main extends Script {
 
     @Inject private HalloweenConfig config;
     @Inject private IdleInput idleInput;
+    @Inject private ItemManager itemManager;
 
     private IpcStore ipc;                 // null when solo (blank Pair ID)
     CursorFlow cursorFlow;                // null when solo
@@ -40,7 +42,7 @@ public class Main extends Script {
         scriptStartTime = System.currentTimeMillis();
         String pairId = config.pairId() == null ? "" : config.pairId().trim();
         slot = Math.max(1, Math.min(8, config.memberSlot()));
-        brain = new EventBrain(this, api, client, config);
+        brain = new EventBrain(this, api, client, config, itemManager);
         autoRun = new AutoRun("Halloween2026").range(20, 50);
 
         if (!pairId.isEmpty()) {

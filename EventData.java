@@ -80,7 +80,9 @@ public final class EventData {
 
     // ── Interfaces ───────────────────────────────────────────────────────────
     public static final int DIANGO_STORE_GROUP = 78;
+    public static final int DIANGO_STORE_CLOSE_CHILD = 2;   // 78.2 "Close" (recorded click)
     public static final int REWARD_GROUP = 807;
+    public static final int REWARD_CLOSE_CHILD = 1;         // 807.1
 
     // ── Texts ────────────────────────────────────────────────────────────────
     public static final String NOT_SCARY = "not even wearing a full costume";

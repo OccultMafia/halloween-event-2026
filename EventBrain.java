@@ -1,7 +1,10 @@
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BooleanSupplier;
 
 import net.runelite.api.Client;
 import net.runelite.api.GameObject;
@@ -11,12 +14,18 @@ import net.runelite.api.NPC;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.widgets.Widget;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStats;
 import org.pureapps.api.Api;
 import org.pureapps.api.util.Reachability;
 
 /**
  * The event as a stage machine keyed on varbit 16579. Looks at the game, does at most one click,
  * returns. Every click first asks Main.cursor(weight) (always true when running solo).
+ *
+ * Each click sets a Pending: what it should lead to (dialogue opens, a varbit flips, an item
+ * arrives) and how long to wait for it. Nothing is clicked again until that happens or it times
+ * out, so a click is never repeated just because the result takes a few ticks to show.
  */
 public final class EventBrain {
 
@@ -24,36 +33,51 @@ public final class EventBrain {
     private static final int W_ACTION = 8;
     private static final int W_WALK = 6;
 
+    /** Chatbox interfaces that mean a dialogue is up (NPC/player chathead, sprite, message box, options). */
+    private static final int[] DIALOGUE_GROUPS = {231, 217, 193, 11, 229, 219};
+
     private final Main main;
     private final Api api;
     private final Client client;
     private final HalloweenConfig config;
+    private final ItemManager itemManager;
 
     private int tick;
     private int lastStage = -1;
+    private int stageSinceTick = 0;
     private String step = "";
 
-    // Pacing: after a click wait for the player to get there / finish, not re-click every tick.
-    private int actionTick = -100;
-    private int waitUntilTick = 0;
+    // ── Pending action ───────────────────────────────────────────────────────
+    private String pendingWhat;
+    private BooleanSupplier pendingDone;
+    private int pendingDeadline;
+    private int pendingSince;
+    private final Map<String, Integer> timeouts = new HashMap<>();
+
+    // Dialogue
+    private int dialogueClickTick = -100;
+    private String lastDialogueText = "";
+    private int dialogueStuckSince = -1;
 
     // Costume
     private int piecesNeeded;
     private int storeVisits = 0;
     private final Set<Integer> takenFromStore = new HashSet<>();
     private final Set<Integer> notWearable = new HashSet<>();
+    private int closeTries = 0;
 
-    // Riddle
+    // Misc
     private int riddleAttempt = 0;
     private int roamIdx = 0;
     private boolean rewardClosed = false;
 
-    public EventBrain(Main main, Api api, Client client, HalloweenConfig config) {
+    public EventBrain(Main main, Api api, Client client, HalloweenConfig config, ItemManager itemManager) {
         this.main = main;
         this.api = api;
         this.client = client;
         this.config = config;
-        this.piecesNeeded = Math.max(1, config.costumePieces());
+        this.itemManager = itemManager;
+        this.piecesNeeded = Math.max(1, Math.min(8, config.costumePieces()));
     }
 
     public int stage() { return client.getVarbitValue(EventData.VARBIT_PROGRESS); }
@@ -62,7 +86,8 @@ public final class EventBrain {
     public String progress() {
         switch (stage()) {
             case EventData.STAGE_SMASH: return "lanterns " + countDone(lanternVarbits()) + "/8";
-            case EventData.STAGE_SPOOK: return "children " + countDone(EventData.CHILD_VARBITS) + "/5";
+            case EventData.STAGE_SPOOK: return "costume " + wornPieces() + "/" + piecesNeeded
+                + ", children " + countDone(EventData.CHILD_VARBITS) + "/5";
             case EventData.STAGE_ADULTS: return "adults " + countDone(EventData.ADULT_VARBITS) + "/5";
             default: return "";
         }
@@ -76,6 +101,7 @@ public final class EventBrain {
             int worn = wornPieces();
             piecesNeeded = Math.min(8, Math.max(piecesNeeded, worn + 1));
             main.info("Child wasn't scared (worn={}): now wearing at least {} pieces", worn, piecesNeeded);
+            clearPending();
         } else if (text.contains(EventData.RIDDLE_WRONG)) {
             riddleAttempt++;
             main.info("Riddle answer rejected (attempt {})", riddleAttempt);
@@ -90,16 +116,19 @@ public final class EventBrain {
         if (stage != lastStage) {
             main.info("Stage {} -> {}", lastStage, stage);
             lastStage = stage;
+            stageSinceTick = tick;
+            clearPending();
         }
 
-        if (stage >= EventData.STAGE_DONE) { finish(); return; }
+        if (stage >= EventData.STAGE_DONE && !dialogueOpen()) { finish(); return; }
+        if (api.player.inCutscene()) { step = "Cutscene"; clearPending(); return; }
+        if (handleDialogue()) return;
+        if (waitingOnPending()) return;
+        if (main.walking()) { step = "Walking: " + step.replace("Walking: ", ""); return; }
 
-        if (api.player.inCutscene()) { step = "Cutscene"; return; }   // no clicks: cursor goes idle
-        if (handleDialogue(stage)) return;
-        if (busy()) return;
-
-        // A Diango store left open outside the costume step: close it.
-        if (stage != EventData.STAGE_SPOOK && storeOpen()) { closeStore(); return; }
+        // Diango's store left open outside the costume step (or once the costume is complete).
+        if (storeOpen() && (stage != EventData.STAGE_SPOOK || storePick() == null)) { closeStore(); return; }
+        closeTries = 0;
 
         switch (stage) {
             case EventData.STAGE_NOT_STARTED:
@@ -130,50 +159,127 @@ public final class EventBrain {
                 talkToChildren();
                 return;
             default:
-                step = "Unknown stage " + stage;
-                return;
+                step = "Waiting (stage " + stage + ")";
         }
+    }
+
+    // ── Pending ──────────────────────────────────────────────────────────────
+
+    private void pending(String what, int timeoutTicks, BooleanSupplier done) {
+        pendingWhat = what;
+        pendingDone = done;
+        pendingSince = tick;
+        pendingDeadline = tick + timeoutTicks;
+    }
+
+    private void clearPending() {
+        pendingWhat = null;
+        pendingDone = null;
+    }
+
+    /** True while the last click's result hasn't shown yet (the deadline moves on while still walking). */
+    private boolean waitingOnPending() {
+        if (pendingDone == null) return false;
+        boolean done;
+        try { done = pendingDone.getAsBoolean(); } catch (Throwable t) { done = true; }
+        if (done) {
+            clearPending();
+            return false;
+        }
+        boolean moving = api.player.isMoving() || api.player.isAnimating() || api.player.isInteracting();
+        if (moving && pendingDeadline - tick < 3 && tick - pendingSince < 30) pendingDeadline = tick + 3;
+        if (tick >= pendingDeadline) {
+            int n = timeouts.merge(pendingWhat, 1, Integer::sum);
+            main.info("No result from '{}' after {} ticks (timeout #{}): retrying", pendingWhat, tick - pendingSince, n);
+            clearPending();
+            return false;
+        }
+        step = "Waiting: " + pendingWhat;
+        return true;
     }
 
     // ── Dialogue ─────────────────────────────────────────────────────────────
 
-    private boolean handleDialogue(int stage) {
+    private boolean dialogueOpen() {
+        if (api.dialogue.isOpen() || api.dialogue.isInputOpen()) return true;
+        for (int g : DIALOGUE_GROUPS) {
+            Widget w = client.getWidget(g, 0);
+            if (w != null && !w.isHidden()) return true;
+        }
+        return false;
+    }
+
+    /** Handles any open dialogue. Returns true whenever one is open, so nothing else is clicked under it. */
+    private boolean handleDialogue() {
         if (api.dialogue.isInputOpen()) {
+            clearPending();
+            if (riddleAttempt > 1) { fail("Riddle answers " + config.riddleAnswer() + " and 105 were both rejected"); return true; }
             String answer = riddleAttempt == 0 ? config.riddleAnswer().trim() : EventData.FALLBACK_RIDDLE_ANSWER;
-            if (riddleAttempt > 1) { fail("Riddle answers " + config.riddleAnswer() + " and 105 both rejected"); return true; }
             step = "Riddle answer " + answer;
-            if (recentlyActed(2)) return true;
+            if (tick - dialogueClickTick < 3) return true;
             if (!main.cursor(W_DIALOGUE)) return true;
             main.info("Entering riddle answer {}", answer);
-            if (api.dialogue.enterText(answer)) acted(2);
+            if (!api.dialogue.enterText(answer)) api.keyboard.typeAndEnter(answer);
+            dialogueClickTick = tick;
             return true;
         }
-        if (!api.dialogue.isOpen()) return false;
+        if (!dialogueOpen()) {
+            dialogueStuckSince = -1;
+            return false;
+        }
+        clearPending();   // whatever we clicked has answered with a dialogue
         step = "Dialogue";
-        if (recentlyActed(1)) return true;
+
+        String text = safe(api.dialogue.getText());
+        if (!text.equals(lastDialogueText)) {
+            lastDialogueText = text;
+            dialogueStuckSince = tick;
+            if (!text.isEmpty()) main.info("Dialogue [{}]: {}", safe(api.dialogue.getSpeaker()), text);
+        }
+        // One click per new line; the next line takes a tick to arrive.
+        if (tick - dialogueClickTick < 1) return true;
 
         if (api.dialogue.hasOptions()) {
+            if (tick - dialogueClickTick < 2) return true;
             if (!main.cursor(W_DIALOGUE)) return true;
             List<String> opts = api.dialogue.getOptions();
+            String pick = null;
             for (String pref : EventData.CHEMIST_OPTIONS) {
-                for (String o : opts) {
-                    if (o != null && o.toLowerCase().contains(pref.toLowerCase())) {
-                        main.info("Dialogue options {} -> '{}'", opts, o);
-                        if (api.dialogue.chooseOption(pref)) acted(1);
-                        return true;
-                    }
-                }
+                if (api.dialogue.findOption(pref) > 0) { pick = pref; break; }
             }
-            main.info("Dialogue options {} (stage {}) -> no known option, picking 1", opts, stage);
-            if (api.dialogue.chooseOption(1)) acted(1);
+            main.info("Dialogue options {} -> {}", opts, pick == null ? "option 1" : "'" + pick + "'");
+            boolean ok = pick != null ? api.dialogue.chooseOption(pick) : api.dialogue.chooseOption(1);
+            if (ok) dialogueClickTick = tick;
             return true;
         }
         if (api.dialogue.canContinue()) {
             if (!main.cursor(W_DIALOGUE)) return true;
-            if (api.dialogue.continueDialogue()) acted(1);
+            if (api.dialogue.continueDialogue()) dialogueClickTick = tick;
             return true;
         }
-        return false;
+        // Open but no continue button found: the line is still being shown, or a box PureApi doesn't
+        // know. Give it 3 ticks, then click any "continue" widget, then press space.
+        if (dialogueStuckSince >= 0 && tick - dialogueStuckSince >= 3 && tick - dialogueClickTick >= 3) {
+            if (!main.cursor(W_DIALOGUE)) return true;
+            Optional<Widget> cont = continueWidget();
+            if (cont.isPresent()) {
+                main.info("Dialogue: clicking '{}' widget", safe(cont.get().getText()));
+                api.widgets.interact(cont.get(), "Continue");
+            } else {
+                main.info("Dialogue: no continue button found - pressing space");
+                api.keyboard.type(" ");
+            }
+            dialogueClickTick = tick;
+        }
+        return true;
+    }
+
+    private Optional<Widget> continueWidget() {
+        for (int g : DIALOGUE_GROUPS) {
+            List<Widget> l = api.widgets.query().group(g).visible().textContains("continue").list();
+            if (!l.isEmpty()) return Optional.of(l.get(0));
+        }
+        return Optional.empty();
     }
 
     // ── Stages ───────────────────────────────────────────────────────────────
@@ -183,13 +289,27 @@ public final class EventBrain {
             ? EventData.HENJA : EventData.ANGEL;
         Optional<NPC> npc = api.npcs.search().withId(first).nearestReachable();
         if (!npc.isPresent()) npc = api.npcs.search().withId(EventData.HENJA, EventData.ANGEL).nearestReachable();
-        npcAction(npc, "Talk-to", EventData.HOUSE, W_ACTION);
+        talkTo(npc, EventData.HOUSE);
+    }
+
+    private void talkToChemist() {
+        talkTo(api.npcs.search().withId(EventData.CHEMIST).nearestReachable(), EventData.CHEMIST_TILE);
+    }
+
+    private void talkTo(Optional<NPC> npc, WorldPoint fallback) {
+        if (!npc.isPresent()) { walk(fallback); return; }
+        NPC n = npc.get();
+        if (!Reachability.canReach(n)) { walk(n.getWorldLocation()); return; }
+        if (!main.cursor(W_ACTION)) return;
+        if (api.npcs.interact(n, "Talk-to")) {
+            main.info("Talk-to {} ({}) at {}", n.getName(), n.getId(), n.getWorldLocation());
+            pending("Talk-to " + n.getName(), 6, this::dialogueOpen);
+        }
     }
 
     private void smashLanterns() {
         // The crate is by the back door: take the 5 old onions now and save a trip at stage 30.
-        if (api.inventory.count(EventData.OLD_ONION) + api.inventory.count(EventData.CANDY_ONION) < 5
-            && api.inventory.emptySlots() > 0) {
+        if (onionsHeld() < 5 && api.inventory.emptySlots() > 0) {
             step = "Take old onions";
             takeOnion();
             return;
@@ -202,16 +322,16 @@ public final class EventBrain {
             int d = me == null ? 0 : me.distanceTo(l.tile);
             if (d < best) { best = d; next = l; }
         }
-        if (next == null) { step = "Lanterns done, waiting"; return; }
-        step = "Smash lantern at " + next.tile.getX() + "," + next.tile.getY();
+        if (next == null) { step = "Lanterns done"; return; }
         final EventData.Lantern target = next;
+        step = "Smash lantern at " + target.tile.getX() + "," + target.tile.getY();
         Optional<GameObject> obj = api.objects.search().atLocation(target.tile)
             .filter(o -> o.getId() == target.baseId || o.getId() == EventData.LANTERN_INTACT).first();
         if (obj.isPresent() && Reachability.canReach(obj.get())) {
             if (!main.cursor(W_ACTION)) return;
             if (api.objects.interact(obj.get(), "Smash")) {
                 main.info("Smash lantern {} at {}", target.baseId, target.tile);
-                acted(2);
+                pending("Smash lantern", 4, () -> client.getVarbitValue(target.varbit) != 0);
             }
             return;
         }
@@ -220,77 +340,92 @@ public final class EventBrain {
 
     private void spookChildren() {
         int[] ids = remaining(EventData.CHILDREN, EventData.CHILD_VARBITS);
-        if (ids.length == 0) { step = "Children done, waiting"; return; }
+        if (ids.length == 0) { step = "Children done"; return; }
         step = "Spook children (" + (5 - ids.length) + "/5)";
         Optional<NPC> npc = api.npcs.search().withId(ids).nearestReachable();
         if (!npc.isPresent()) { roam(); return; }
-        npcAction(npc, "Spook", null, W_ACTION);
-    }
-
-    private void talkToChemist() {
-        Optional<NPC> npc = api.npcs.search().withId(EventData.CHEMIST).nearestReachable();
-        npcAction(npc, "Talk-to", EventData.CHEMIST_TILE, W_ACTION);
+        NPC n = npc.get();
+        if (!Reachability.canReach(n)) { walk(n.getWorldLocation()); return; }
+        final int varbit = varbitFor(n.getId(), EventData.CHILDREN, EventData.CHILD_VARBITS);
+        if (!main.cursor(W_ACTION)) return;
+        if (api.npcs.interact(n, "Spook")) {
+            main.info("Spook child {} at {}", n.getId(), n.getWorldLocation());
+            pending("Spook child", 5, () -> client.getVarbitValue(varbit) != 0);
+        }
     }
 
     private void candyOnions() {
         int[] ids = remaining(EventData.ADULTS, EventData.ADULT_VARBITS);
-        if (ids.length == 0) { step = "Adults done, waiting"; return; }
+        if (ids.length == 0) { step = "Adults done"; return; }
         int candy = api.inventory.count(EventData.CANDY_ONION);
         int old = api.inventory.count(EventData.OLD_ONION);
+        boolean molten = api.inventory.contains(EventData.MOLTEN_SUGAR);
 
-        if (candy >= ids.length || (candy > 0 && old == 0 && !api.inventory.contains(EventData.MOLTEN_SUGAR)
-                && !api.inventory.contains(EventData.SUGAR))) {
+        // Coat every old onion first while standing at the range (0-tick, no walking between).
+        if (molten && old > 0 && candy < ids.length) {
+            step = "Dip onions (" + candy + "/" + ids.length + ")";
+            if (!main.cursor(W_ACTION)) return;
+            final int before = candy;
+            if (api.inventory.useOnItem(EventData.MOLTEN_SUGAR, EventData.OLD_ONION)) {
+                pending("Dip onion", 2, () -> api.inventory.count(EventData.CANDY_ONION) > before);
+            }
+            return;
+        }
+        if (candy > 0 && (candy >= ids.length || old == 0)) {
             step = "Give candy onions (" + (5 - ids.length) + "/5)";
             Optional<NPC> npc = api.npcs.search().withId(ids).nearestReachable();
             if (!npc.isPresent()) { roam(); return; }
             NPC n = npc.get();
             if (!Reachability.canReach(n)) { walk(n.getWorldLocation()); return; }
+            final int varbit = varbitFor(n.getId(), EventData.ADULTS, EventData.ADULT_VARBITS);
             if (!main.cursor(W_ACTION)) return;
             if (api.inventory.useOnNpc(EventData.CANDY_ONION, n)) {
                 main.info("Candy onion -> adult {} at {}", n.getId(), n.getWorldLocation());
-                acted(2);
+                // The adult answers with a dialogue line (handled), then eats it and the varbit flips.
+                pending("Give candy onion", 8, () -> client.getVarbitValue(varbit) != 0);
             }
             return;
         }
-        if (candy + old < ids.length && api.inventory.emptySlots() > 0) {
+        if (candy + old < ids.length) {
+            if (api.inventory.emptySlots() == 0) { fail("Inventory full: can't take more old onions"); return; }
             step = "Take old onions";
             takeOnion();
             return;
         }
-        if (!api.inventory.contains(EventData.MOLTEN_SUGAR)) {
-            if (api.inventory.contains(EventData.SUGAR)) {
-                step = "Melt sugar on the range";
-                Optional<GameObject> range = api.objects.search().withId(EventData.RANGE).nearestReachable();
-                if (range.isPresent() && Reachability.canReach(range.get())) {
-                    if (!main.cursor(W_ACTION)) return;
-                    if (api.inventory.useOnObject(EventData.SUGAR, range.get())) {
-                        main.info("Sugar -> range");
-                        acted(2);
-                    }
-                    return;
-                }
-                walk(EventData.RANGE_TILE);
+        if (!molten) {
+            if (!api.inventory.contains(EventData.SUGAR)) {
+                // The sugar arrives a tick after the riddle dialogue: only go back once it's really gone.
+                if (tick - stageSinceTick < 5) { step = "Waiting for the sugar"; return; }
+                step = "Sugar lost: back to the Chemist";
+                talkToChemist();
                 return;
             }
-            step = "Sugar lost: back to the Chemist";
-            talkToChemist();
-            return;
+            step = "Melt sugar on the range";
+            Optional<GameObject> range = api.objects.search().withId(EventData.RANGE).nearestReachable();
+            if (range.isPresent() && Reachability.canReach(range.get())) {
+                if (!main.cursor(W_ACTION)) return;
+                if (api.inventory.useOnObject(EventData.SUGAR, range.get())) {
+                    main.info("Sugar -> range at {}", range.get().getWorldLocation());
+                    pending("Melt sugar", 6, () -> api.inventory.contains(EventData.MOLTEN_SUGAR));
+                }
+                return;
+            }
+            walk(EventData.RANGE_TILE);
         }
-        if (old > 0) {
-            step = "Dip onions (" + candy + " candy)";
-            if (!main.cursor(W_ACTION)) return;
-            if (api.inventory.useOnItem(EventData.MOLTEN_SUGAR, EventData.OLD_ONION)) acted(1);
-            return;
-        }
-        step = "Need onions but inventory is full";
-        fail("Inventory full: can't take more old onions");
+    }
+
+    private int onionsHeld() {
+        return api.inventory.count(EventData.OLD_ONION) + api.inventory.count(EventData.CANDY_ONION);
     }
 
     private void takeOnion() {
         Optional<GameObject> crate = api.objects.search().withId(EventData.CRATE_OF_ONIONS).nearestReachable();
         if (crate.isPresent() && Reachability.canReach(crate.get())) {
             if (!main.cursor(W_ACTION)) return;
-            if (api.objects.interact(crate.get(), "Take-from")) acted(1);
+            final int before = api.inventory.count(EventData.OLD_ONION);
+            if (api.objects.interact(crate.get(), "Take-from")) {
+                pending("Take onion", 4, () -> api.inventory.count(EventData.OLD_ONION) > before);
+            }
             return;
         }
         walk(EventData.CRATE_TILE);
@@ -299,38 +434,37 @@ public final class EventBrain {
     // ── Costume (Diango's Holiday-items) ─────────────────────────────────────
 
     private void costume() {
-        // 1. Wear any Halloween piece already in the inventory.
-        Item wear = inventoryWearable();
+        // 1. Wear a Halloween piece from the inventory whose slot has no Halloween piece yet.
+        Item wear = wearableForFreeSlot();
         if (wear != null) {
             if (storeOpen()) { closeStore(); return; }
-            step = "Wear " + itemName(wear.getId());
+            final int id = wear.getId();
+            step = "Wear " + itemName(id);
             if (!main.cursor(W_ACTION)) return;
-            if (api.inventory.equip(wear.getId())) {
-                main.info("Wear {} ({}/{} pieces)", itemName(wear.getId()), wornPieces() + 1, piecesNeeded);
+            if (api.inventory.equip(id)) {
+                main.info("Wear {} (slot {}, {}/{} pieces)", itemName(id), slotOf(id), wornPieces() + 1, piecesNeeded);
+                pending("Wear " + itemName(id), 3, () -> isWorn(id));
             } else {
-                notWearable.add(wear.getId());
+                notWearable.add(id);
             }
-            acted(1);
             return;
         }
-        // 2. Store open: take pieces of the chosen set first, then the fallback sets.
+        // 2. Store open: take pieces for slots nothing covers yet.
         if (storeOpen()) {
             Widget pick = storePick();
-            if (pick != null) {
-                step = "Take " + itemName(pick.getItemId());
-                if (!main.cursor(W_ACTION)) return;
-                if (api.widgets.interact(pick, "Take")) {
-                    takenFromStore.add(pick.getItemId());
-                    main.info("Diango: take {}", itemName(pick.getItemId()));
-                    acted(1);
-                }
-                return;
+            if (pick == null) { closeStore(); return; }
+            final int id = pick.getItemId();
+            step = "Take " + itemName(id);
+            if (!main.cursor(W_ACTION)) return;
+            if (api.widgets.interact(pick, "Take")) {
+                takenFromStore.add(id);
+                main.info("Diango: take {} (slot {})", itemName(id), slotOf(id));
+                pending("Take " + itemName(id), 3, () -> api.inventory.contains(id));
             }
-            closeStore();
             return;
         }
-        if (storeVisits >= 2) {
-            fail("Diango has no more Halloween pieces to give: wear " + piecesNeeded + " pieces by hand");
+        if (storeVisits >= 3) {
+            fail("Diango has no more Halloween pieces for free slots: wear " + piecesNeeded + " pieces by hand");
             return;
         }
         // 3. Go to Diango.
@@ -342,78 +476,139 @@ public final class EventBrain {
             if (api.npcs.interact(diango.get(), "Holiday-items")) {
                 storeVisits++;
                 main.info("Diango: Holiday-items (visit {})", storeVisits);
-                acted(2);
+                pending("Open Diango's store", 6, this::storeOpen);
             }
             return;
         }
         walk(EventData.DIANGO_TILE);
     }
 
+    /**
+     * Next store item to take: one per free equipment slot, the chosen set first, then the other
+     * sets, until worn + carried pieces cover piecesNeeded slots. Null when nothing more is needed.
+     */
     private Widget storePick() {
-        int have = wornPieces() + inventoryPieces();
-        CostumeSet preferred = config.costumeSet();
+        Set<Integer> covered = coveredSlots();
+        if (covered.size() >= piecesNeeded) return null;
         List<Widget> items = api.widgets.query().group(EventData.DIANGO_STORE_GROUP).list();
-        // Preferred set: take every piece (a full set reads as a costume).
-        for (Widget w : items) {
-            int id = w.getItemId();
-            if (id <= 0 || takenFromStore.contains(id)) continue;
-            if (preferred.matches(itemName(id))) return w;
-        }
-        if (have >= piecesNeeded) return null;
-        // Fallback sets for slots the preferred set couldn't fill.
+        CostumeSet preferred = config.costumeSet();
+        Widget pick = pickFrom(items, covered, preferred);
+        if (pick != null) return pick;
         for (CostumeSet s : CostumeSet.values()) {
             if (s == preferred) continue;
-            for (Widget w : items) {
-                int id = w.getItemId();
-                if (id <= 0 || takenFromStore.contains(id)) continue;
-                if (s.matches(itemName(id))) return w;
-            }
+            pick = pickFrom(items, covered, s);
+            if (pick != null) return pick;
         }
         return null;
     }
 
-    private boolean storeOpen() {
-        try {
-            return api.widgets.query().group(EventData.DIANGO_STORE_GROUP).visible().exists();
-        } catch (Throwable t) {
-            return false;
+    private Widget pickFrom(List<Widget> items, Set<Integer> covered, CostumeSet set) {
+        for (Widget w : items) {
+            int id = w.getItemId();
+            if (id <= 0 || takenFromStore.contains(id) || w.isHidden()) continue;
+            if (!set.matches(itemName(id))) continue;
+            int slot = slotOf(id);
+            if (slot < 0 || covered.contains(slot)) continue;
+            return w;
         }
+        return null;
     }
 
-    private void closeStore() {
-        step = "Close Diango's store";
-        List<Widget> close = api.widgets.query().group(EventData.DIANGO_STORE_GROUP).hasAction("Close").list();
-        if (close.isEmpty()) { main.info("Diango store: no Close button found"); return; }
-        if (!main.cursor(W_ACTION)) return;
-        if (api.widgets.interact(close.get(0), "Close")) acted(1);
+    /** Equipment slots covered by a Halloween piece, worn or carried. */
+    private Set<Integer> coveredSlots() {
+        Set<Integer> s = new HashSet<>();
+        for (int id : halloweenIds(InventoryID.WORN)) s.add(slotOf(id));
+        for (int id : halloweenIds(InventoryID.INV)) s.add(slotOf(id));
+        s.remove(-1);
+        return s;
     }
 
-    private int wornPieces() {
-        return countHalloween(client.getItemContainer(InventoryID.WORN));
-    }
-
-    private int inventoryPieces() {
-        return countHalloween(client.getItemContainer(InventoryID.INV));
-    }
-
-    private int countHalloween(ItemContainer c) {
-        if (c == null) return 0;
-        int n = 0;
-        for (Item i : c.getItems()) {
-            if (i == null || i.getId() <= 0 || notWearable.contains(i.getId())) continue;
-            if (CostumeSet.isHalloweenWearable(itemName(i.getId()))) n++;
-        }
-        return n;
-    }
-
-    private Item inventoryWearable() {
+    private Item wearableForFreeSlot() {
+        Set<Integer> wornSlots = new HashSet<>();
+        for (int id : halloweenIds(InventoryID.WORN)) wornSlots.add(slotOf(id));
         ItemContainer c = client.getItemContainer(InventoryID.INV);
         if (c == null) return null;
         for (Item i : c.getItems()) {
             if (i == null || i.getId() <= 0 || notWearable.contains(i.getId())) continue;
-            if (CostumeSet.isHalloweenWearable(itemName(i.getId()))) return i;
+            if (!CostumeSet.isHalloweenWearable(itemName(i.getId()))) continue;
+            int slot = slotOf(i.getId());
+            if (slot < 0 || wornSlots.contains(slot)) continue;
+            return i;
         }
         return null;
+    }
+
+    private List<Integer> halloweenIds(int containerId) {
+        List<Integer> out = new java.util.ArrayList<>();
+        ItemContainer c = client.getItemContainer(containerId);
+        if (c == null) return out;
+        for (Item i : c.getItems()) {
+            if (i == null || i.getId() <= 0 || notWearable.contains(i.getId())) continue;
+            if (CostumeSet.isHalloweenWearable(itemName(i.getId()))) out.add(i.getId());
+        }
+        return out;
+    }
+
+    private int wornPieces() {
+        Set<Integer> s = new HashSet<>();
+        for (int id : halloweenIds(InventoryID.WORN)) s.add(slotOf(id));
+        return s.size();
+    }
+
+    private boolean isWorn(int id) {
+        return halloweenIds(InventoryID.WORN).contains(id);
+    }
+
+    /** Equipment slot index of an item, or -1 when it can't be worn. */
+    private int slotOf(int id) {
+        try {
+            ItemStats st = itemManager.getItemStats(id);
+            if (st == null || !st.isEquipable() || st.getEquipment() == null) return -1;
+            return st.getEquipment().getSlot();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private boolean storeOpen() {
+        Widget w = client.getWidget(EventData.DIANGO_STORE_GROUP, 0);
+        return w != null && !w.isHidden();
+    }
+
+    /** Closes Diango's store with its own Close button (78.2), the way a player clicks the X. */
+    private void closeStore() {
+        step = "Close Diango's store";
+        if (pendingDone != null) return;
+        if (!main.cursor(W_ACTION)) return;
+        closeTries++;
+        Widget close = client.getWidget(EventData.DIANGO_STORE_GROUP, EventData.DIANGO_STORE_CLOSE_CHILD);
+        boolean sent = false;
+        if (close != null && !close.isHidden()) {
+            sent = api.widgets.interact(close, "Close");
+            if (!sent && close.getChildren() != null) {
+                for (Widget ch : close.getChildren()) {
+                    if (ch != null && hasAction(ch, "Close")) { sent = api.widgets.interact(ch, "Close"); break; }
+                }
+            }
+        }
+        if (!sent) {
+            List<Widget> any = api.widgets.query().group(EventData.DIANGO_STORE_GROUP).visible().hasAction("Close").list();
+            if (!any.isEmpty()) sent = api.widgets.interact(any.get(0), "Close");
+        }
+        main.info("Diango store: Close {} (try {})", sent ? "clicked" : "NOT found", closeTries);
+        if (!sent && closeTries >= 3) {
+            // Last resort: walking away closes any interface.
+            WorldPoint me = api.player.getWorldLocation();
+            if (me != null) api.movement.walk(new WorldPoint(me.getX(), me.getY() - 2, me.getPlane()));
+        }
+        pending("Close Diango's store", 3, () -> !storeOpen());
+    }
+
+    private static boolean hasAction(Widget w, String action) {
+        String[] a = w.getActions();
+        if (a == null) return false;
+        for (String s : a) if (s != null && s.equalsIgnoreCase(action)) return true;
+        return false;
     }
 
     private String itemName(int id) {
@@ -425,12 +620,12 @@ public final class EventBrain {
     private void finish() {
         step = "Complete";
         if (!rewardClosed) {
-            List<Widget> close = api.widgets.query().group(EventData.REWARD_GROUP).hasAction("Close").list();
-            if (!close.isEmpty() && main.cursor(W_ACTION)) {
-                api.widgets.interact(close.get(0), "Close");
-            }
             rewardClosed = true;
-            return;
+            Widget close = client.getWidget(EventData.REWARD_GROUP, EventData.REWARD_CLOSE_CHILD);
+            if (close != null && !close.isHidden() && main.cursor(W_ACTION)) {
+                api.widgets.interact(close, "Close");
+                return;
+            }
         }
         main.complete();
     }
@@ -442,23 +637,6 @@ public final class EventBrain {
 
     // ── Helpers ──────────────────────────────────────────────────────────────
 
-    private void npcAction(Optional<NPC> npc, String action, WorldPoint fallback, int weight) {
-        if (npc.isPresent()) {
-            NPC n = npc.get();
-            if (Reachability.canReach(n)) {
-                if (!main.cursor(weight)) return;
-                if (api.npcs.interact(n, action)) {
-                    main.info("{} {} ({}) at {}", action, n.getName(), n.getId(), n.getWorldLocation());
-                    acted(2);
-                }
-                return;
-            }
-            walk(n.getWorldLocation());
-            return;
-        }
-        if (fallback != null) walk(fallback);
-    }
-
     private void walk(WorldPoint tile) {
         if (main.walking()) return;
         WorldPoint me = api.player.getWorldLocation();
@@ -466,7 +644,7 @@ public final class EventBrain {
         if (!main.cursor(W_WALK)) return;
         main.info("Walk to {}", tile);
         api.walker.walkTo(tile);
-        acted(1);
+        pending("Walk to " + tile.getX() + "," + tile.getY(), 2, () -> api.walker.isWalking());
     }
 
     private void roam() {
@@ -480,7 +658,6 @@ public final class EventBrain {
         walk(p);
     }
 
-    /** NPC ids whose sub-varbit is still 0. */
     private int[] remaining(int[] ids, int[] varbits) {
         int n = 0;
         int[] out = new int[ids.length];
@@ -488,6 +665,11 @@ public final class EventBrain {
             if (client.getVarbitValue(varbits[i]) == 0) out[n++] = ids[i];
         }
         return java.util.Arrays.copyOf(out, n);
+    }
+
+    private static int varbitFor(int npcId, int[] ids, int[] varbits) {
+        for (int i = 0; i < ids.length; i++) if (ids[i] == npcId) return varbits[i];
+        return varbits[0];
     }
 
     private int countDone(int[] varbits) {
@@ -502,19 +684,5 @@ public final class EventBrain {
         return v;
     }
 
-    private void acted(int minTicks) {
-        actionTick = tick;
-        waitUntilTick = tick + minTicks;
-    }
-
-    private boolean recentlyActed(int ticks) {
-        return tick - actionTick < ticks;
-    }
-
-    /** Still walking to / doing the last click (up to 15 ticks), or our own walk is running. */
-    private boolean busy() {
-        if (main.walking()) { step = step.startsWith("Walk") ? step : "Walking: " + step; return true; }
-        if (tick < waitUntilTick) return true;
-        return tick - actionTick < 15 && (api.player.isMoving() || api.player.isAnimating());
-    }
+    private static String safe(String s) { return s == null ? "" : s; }
 }
